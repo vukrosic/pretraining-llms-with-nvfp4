@@ -99,17 +99,26 @@ Quantizing the entire model to FP4 can lead to divergence (model stops learning)
       *   **The Fix in Action:** Randomization fixes this by randomly flipping the signs of the transform's rows, changing the pattern to something like `[+, -, +, -]`. When this new, misaligned pattern is applied to the same data, the values now cancel each other out (`10 - 8 - 12 + 9 = -1`), preventing the creation of a new outlier.
       *   **Practical Takeaway:** To prevent this, the Hadamard matrix itself is randomized. The paper found that creating a single random matrix once and reusing it for the entire training run was sufficient.
   
-  ### 3. Two-Dimensional (2D) Weight Scaling
+  ### 3. Two-Dimensional (2D) Weight Scaling for Consistent Quantization
   
-  During training, a tensor (like the model's weights) is processed in one direction in the forward pass and the opposite (transposed) direction in the backward pass. This can cause a problem: the same weight value can be quantized differently in the two passes, which violates the chain rule of calculus that underpins model learning.
-
-### 4. Unbiased Gradient Estimation with Stochastic Rounding
-
-Deterministic rounding methods can introduce systematic bias during quantization, particularly for gradient tensors. Stochastic rounding is a probabilistic technique that mitigates this bias.
-
-**Implementation:**
-*   Apply **stochastic rounding** when quantizing all gradient tensors to FP4.
-*   Use the deterministic **round-to-nearest-even** method for weights and activations, as stochastic rounding can introduce counterproductive noise in the forward pass.
+  To understand this technique, imagine a tiny 2x2 block of weights from a larger matrix: `[[W₁₁, W₁₂], [W₂₁, W₂₂]]`.
+  
+  **The Problem (Inconsistent 1D Scaling):**
+  During training, this block is processed differently in the two main passes:
+  *   **Forward Pass (Row-wise):** The weight `W₁₁` is grouped with its row-mate `W₁₂`. They are scaled together based on `max(abs(W₁₁), abs(W₁₂))`.
+  *   **Backward Pass (Column-wise):** Because the weight matrix is transposed for the backward pass, `W₁₁` is now grouped with its column-mate `W₂₁`. They are scaled together based on `max(abs(W₁₁), abs(W₂₁))`.
+  For example, if `W₁₁ = 2.0`, `W₁₂ = 10.0`, and `W₂₁ = 0.5`, then in the forward pass (row-wise scaling), `W₁₁` is quantized using the max of its row (`max(2.0, 10.0) = 10.0`), but in the backward pass (column-wise scaling), it's quantized using the max of its column (`max(2.0, 0.5) = 2.0`). So `W₁₁` ends up with two different quantized values, breaking the chain rule.
+  
+  **The Solution (Consistent 2D Scaling):**
+  Instead of scaling row-by-row, 2D scaling treats the entire 2x2 block as a single unit.
+  *   **How it works:** A *single* scaling factor is calculated for the whole block, based on the maximum absolute value of all four weights: `max(abs(W₁₁), abs(W₁₂), abs(W₂₁), abs(W₂₂))`.
+  *   **The Result:** Because the same scaling factor is used for the entire square, it doesn't matter if it's processed row-wise or column-wise. The quantized value for `W₁₁` is now guaranteed to be the same in both the forward and backward passes, preserving consistency.
+  
+  **Practical Takeaway:** The paper applies this principle using larger 16x16 blocks. Use 16x16 2D block scaling for weight tensors to ensure consistency. For activations and gradients, standard 1D scaling is sufficient, as training is less sensitive to inconsistencies in those tensors.
+  
+  ### 4. Stochastic Rounding for Unbiased Gradients
+  
+  When quantizing, many values will fall between the few representable points of FP4. Standard rounding (e.g., always rounding to the nearest value) can introduce a systematic bias. If slightly more numbers round down than up, for instance, there's a consistent downward drift in the values, which can harm learning.
 
 ## Empirical Validation: 12B Model on 10T Tokens
 
