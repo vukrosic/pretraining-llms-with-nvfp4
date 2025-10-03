@@ -24,14 +24,21 @@ The presence of outliers - ex. `50` in `[0.5, -0.2, 1.1, -0.8, 50.0]` - is a maj
     *   **The Outlier:** The value `50.0` is a significant outlier.
     *   **Scaling:** To quantize this block into FP4, which has a maximum representable value of `6.0`, we must scale every number down with the same scaling factor. `Scale Factor = 6.0 / 50.0 = 0.12`. The scaling factor is based on the largest number (taken absolute value)
     *   **Result:** After scaling (multiplying), our block becomes `[0.06, -0.024, 0.132, -0.096, 6.0]`.
-    Here, the values that can be represented in FP4 (E2M1) are ±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, and ±6. This means that after scaling, any value in the block will be rounded to the nearest of these discrete numbers. The representable range is thus from -6 to +6, with only these specific values available.
-    *   **Information Loss:** When these new values are converted to the closest representable FP4 number (e.g., `±0`, `±0.5`, `±1.0`...), the first four values are so small that they will likely all be rounded to zero. The original information they contained is lost. Only the outlier retains its significance. NVFP4's techniques are designed to mitigate exactly this problem.
+    *   **Information Loss:** After scaling, the values are rounded to the nearest representable number in the FP4 (E2M1) format. This format has a very limited set of values it can store: `{±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}`. The first four values in our scaled block (`0.06`, `-0.024`, `0.132`, `-0.096`) are now so small that they will all be rounded to zero. The original information they contained is lost, while only the outlier retains its significance. NVFP4's techniques are designed to mitigate exactly this problem.
 
 ## Technical Advantages of NVFP4
 
-Transitioning from FP8 to FP4 can yield a 2-3x increase in **arithmetic performance**—primarily the throughput of General Matrix Multiplication (GEMM) operations, which are the computational core of transformers—and a 50% reduction in memory usage. However, the lower precision introduces challenges. NVFP4 is designed to address these issues through several key features:
+Transitioning from FP8 to FP4 can yield a 2-3x increase in **arithmetic performance**—primarily the throughput of General Matrix Multiplication (GEMM) operations, which are the computational core of transformers—and a 50% reduction in memory usage. Compared to the widely-used BF16 format, this translates to a **4x to 6x performance boost** on NVIDIA Blackwell Tensor Cores. However, the lower precision introduces challenges. NVFP4 is designed to address these issues through several key features:
 
 *   **Two-Level Scaling for High-Precision Representation:** In short, there are two scaling factors: one that applies to an entire tensor (like weights or activations, often millions of values), and a second that applies to each 16-element block within that tensor.
+
+    ```text
+    An NVFP4 Block:
+    +--------------------+----------------------------------+
+    | FP8 Scale Factor   | 16 x FP4 Elements                |
+    | (e.g., 2.5e-2)     | [0.5, -2, ..., 4, -3, 6]         |
+    +--------------------+----------------------------------+
+    ```
 
 NVFP4 uses two distinct scaling factors, which is its most critical feature. To understand this, let's define two terms:
     *   A **Tensor** is a large, multi-dimensional array of numbers that holds the model's weights or activations. These are the core data structures in a neural network, and their scale can be immense. Here are some concrete examples based on the models described in the paper:
@@ -86,8 +93,8 @@ Quantizing the entire model to FP4 can lead to divergence (model stops learning)
             [ 0.5,  0.5, -0.5, -0.5 ]
             [ 0.5, -0.5, -0.5,  0.5 ]
   ```
-  Multiplying the original block `[1.0, -2.0, 1.5, 30.0]` by this matrix (`[1.0, -2.0, 1.5, 30.0] × H`) gives the new values.
-  
+  Multiplying the original block `[1.0, -2.0, 1.5, 30.0]` by this matrix (`[1.0, -2.0, 1.5, 30.0] × H`) gives the new values. For example, the first new value is calculated as: `(1.0 * 0.5) + (-2.0 * 0.5) + (1.5 * 0.5) + (30.0 * 0.5) = 0.5 - 1.0 + 0.75 + 15.0 = 15.25`.
+
   **What is this matrix?** The matrix `H` is a normalized **Hadamard matrix**, a fixed, constant matrix chosen for its key property: **orthogonality**. This property guarantees the transform is perfectly reversible (`H × H^T = I`). The practical implication for researchers is that this isn't a learned parameter but a standard mathematical tool that allows for a temporary, lossless transformation of the data into a more quantization-friendly format.
 
   **Implementation:**
@@ -141,9 +148,17 @@ Quantizing the entire model to FP4 can lead to divergence (model stops learning)
   
   **Practical Takeaway:** The paper found it was essential to apply **stochastic rounding** when quantizing gradient tensors. However, for weights and activations in the forward pass, standard **round-to-nearest-even** is better, as the noise from stochastic rounding can be harmful there.
   
-  ## Empirical Validation: 12B Model on 10T Tokens
+  ### 5. A Final Trick: Switching to Higher Precision
   
-  The paper validates this four-part methodology by pretraining a 12-billion-parameter model on an unprecedented 10 trillion tokens.
+  For cases where the FP4 training loss doesn't perfectly match the higher-precision baseline, the paper offers a practical solution to close the final gap.
+  
+  **The Technique:** Switch from NVFP4 to a higher precision format like BF16 for the final phase of training (e.g., the last 10-20%, typically during the learning rate decay schedule).
+  
+  **The Result:** This method can fully recover the small remaining loss difference. The paper notes that the loss gap primarily arises from quantization in the *forward pass*, so you get the most benefit by switching only the forward pass computations to BF16. This minimizes the performance impact while maximizing the accuracy gain.
+
+## Empirical Validation: 12B Model on 10T Tokens
+
+The paper validates this four-part methodology by pretraining a 12-billion-parameter model on an unprecedented 10 trillion tokens.
 
 **Results:**
 *   **Training Loss:** The validation loss for the NVFP4-trained model closely matched the FP8 baseline throughout the 10T token run.
