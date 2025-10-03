@@ -61,22 +61,44 @@ Quantizing the entire model to FP4 can lead to divergence (model stops learning)
 *   Use NVFP4 for the majority of GEMM operations within the linear (fully-connected) layers.
 *   Maintain a small percentage of numerically sensitive linear layers (approx. 15%) in a higher precision format like BF16. The paper found that the **final layers** of the network are the most sensitive, as they require a greater dynamic range and more precision than FP4 can provide. Keeping the first and last few blocks of the model in a higher format is often sufficient to ensure stable training.
 *   Keep other critical components in their original precision (BF16 or FP32) to ensure numerical stability. This includes embeddings, the output projection head, normalization layers, non-linearities, and most parts of the attention mechanism (softmax, etc.). Only the large GEMM operations in the transformer blocks are targeted for FP4 quantization.
+  
+  ### 2. Random Hadamard Transforms (RHT) for Outlier Management
 
-### 2. Outlier Management with Random Hadamard Transforms (RHT)
+  This is a cool trick. If you want to quantize both `Activations × Weights` to FP4, you can have a matrix `H`, such that `H × H = I (Identity Matrix)` -> `H` is orthogonal.
 
-Large-magnitude outliers can degrade accuracy in low-precision formats. RHT is an orthogonal transformation used to redistribute these outlier values into a more Gaussian-like distribution, making them more representable in FP4.
+  Then you can do `(Activations × H) × (H × Weights)`
 
-**Implementation:**
-*   Apply RHT to the inputs of the weight gradient GEMMs (`Wgrad`), as this has the most significant impact on training stability.
-*   A Hadamard matrix size of 16x16 offers a good trade-off between outlier mitigation and computational overhead for large-scale models.
+  This will have the same result as `Activations × Weights` but it will reduce issues with outliers (precision loss) during quantization of `Activations` and `Weights`.
+  
+  **An Example in Action:**
+  *   **Original Block:** Consider a small block of four numbers: `[1.0, -2.0, 1.5, 30.0]`.
+  *   **The Problem:** The outlier is `30.0`. To quantize this, everything must be scaled down based on this large value, causing the first three numbers to lose their precision.
+  *   **The RHT Transform:** After applying the Hadamard transform, the block becomes: `[15.25, -12.75, -16.25, 15.75]`.
+  *   **The Result:** The large outlier `30.0` is gone. The energy has been redistributed, and the new maximum absolute value is only `16.25`.
+  *   **The Benefit:** When this new block is scaled to fit into FP4's range, the scaling factor is almost twice as large. This means the other values are scaled to larger, more distinct numbers, preserving significantly more of their original information before the final rounding to FP4.
+  
+  **The Math Behind the Example:**
+  
+  The transform is a matrix-vector multiplication. For the 4-number block in the example, the calculation uses a normalized 4x4 Hadamard matrix (`H`):
+  ```
+            [ 0.5,  0.5,  0.5,  0.5 ]
+  H =       [ 0.5, -0.5,  0.5, -0.5 ]
+            [ 0.5,  0.5, -0.5, -0.5 ]
+            [ 0.5, -0.5, -0.5,  0.5 ]
+  ```
+  Multiplying the original block `[1.0, -2.0, 1.5, 30.0]` by this matrix (`[1.0, -2.0, 1.5, 30.0] × H`) gives the new values.
+  
+  **What is this matrix?** The matrix `H` is a normalized **Hadamard matrix**, a fixed, constant matrix chosen for its key property: **orthogonality**. This property guarantees the transform is perfectly reversible (`H × H^T = I`). The practical implication for researchers is that this isn't a learned parameter but a standard mathematical tool that allows for a temporary, lossless transformation of the data into a more quantization-friendly format.
 
-### 3. Consistent Quantization with 2D Block Scaling
-
-The backward pass in training involves transposing tensors, which can lead to different quantization schemes being applied in the forward and backward passes. This inconsistency can violate the chain rule and negatively affect convergence.
-
-**Implementation:**
-*   For weight tensors, use a **two-dimensional (2D) block scaling** strategy with a block size of 16x16. This ensures the same quantization is applied in both passes.
-*   For activations and gradients, the standard 1D (1x16) block scaling is sufficient.
+  **Implementation:**
+  
+  *   **Target the Right Operation:** RHT is not applied everywhere. The paper found it was most critical for stability when applied to the **weight gradient (`Wgrad`) calculation**. This is the part of the backward pass where the model calculates the updates for its weights. Applying it elsewhere (like the forward pass) provided no benefit and could even hurt performance.
+  *   **Choose an Effective Matrix Size:** The transform is performed by multiplying the data with a "Hadamard Matrix." A larger matrix spreads outliers more effectively but is more computationally expensive. The paper found that a **16x16 matrix** provides the best trade-off for large models, offering strong outlier mitigation without too much compute overhead.
+  *   **Use Randomization:** The "Random" in RHT comes from multiplying the data by a random vector of +1s and -1s. This "shakes up" the data and prevents specific, structured patterns of outliers from surviving the transform. The study showed that a single random vector, fixed for the entire training run, was sufficient.
+  
+  ### 3. Two-Dimensional (2D) Weight Scaling
+  
+  During training, a tensor (like the model's weights) is processed in one direction in the forward pass and the opposite (transposed) direction in the backward pass. This can cause a problem: the same weight value can be quantized differently in the two passes, which violates the chain rule of calculus that underpins model learning.
 
 ### 4. Unbiased Gradient Estimation with Stochastic Rounding
 
