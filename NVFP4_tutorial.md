@@ -9,7 +9,7 @@ The growing scale of Large Language Models (LLMs) necessitates more efficient tr
 
 Before diving into NVFP4, it's essential to understand a few foundational concepts.
 
-You can copy the 3 points below into an AI chatbot for personalized lessons.
+You can copy the content below into an AI chatbot for personalized lessons.
 
 *   **Numerical Precision:** In deep learning, numbers are typically stored in floating-point formats (e.g., FP32, FP16, BF16, FP8, FP4). The number in the format name indicates the number of bits used to represent a single number. More bits (like in FP32) allow for a wider range of numbers and higher precision (more detail), but consume more memory and are computationally slower. Fewer bits (like in FP4) are faster and more memory-efficient but have lower precision.
 
@@ -17,7 +17,9 @@ You can copy the 3 points below into an AI chatbot for personalized lessons.
 
 *   **Dynamic Range:** This refers to the range of values that can be represented by a numerical format, from the smallest non-zero number to the largest. When quantizing, we often scale the values in a tensor to fit within the limited dynamic range of the target format (e.g., FP4). A key challenge is that a single very large value (an "outlier") can dominate the entire range, forcing all other smaller values to be quantized to zero or near-zero, effectively erasing their information.
 
-*   **The Outlier Problem in Scaling (An Example):** The presence of outliers - ex. `50` in `[0.5, -0.2, 1.1, -0.8, 50.0]` - is a major challenge in quantization. Because the scaling factor for a block of numbers is determined by the single largest value, one outlier can ruin the precision for all other numbers in its block.
+## The Outlier Problem in Scaling (An Example)
+
+The presence of outliers - ex. `50` in `[0.5, -0.2, 1.1, -0.8, 50.0]` - is a major challenge in quantization. Because the scaling factor for a block of numbers is determined by the single largest value, one outlier can ruin the precision for all other numbers in its block.
     *   **Scenario:** Imagine we have a small block of numbers: `[0.5, -0.2, 1.1, -0.8, 50.0]`
     *   **The Outlier:** The value `50.0` is a significant outlier.
     *   **Scaling:** To quantize this block into FP4, which has a maximum representable value of `6.0`, we must scale every number down with the same scaling factor. `Scale Factor = 6.0 / 50.0 = 0.12`. The scaling factor is based on the largest number (taken absolute value)
@@ -38,8 +40,8 @@ NVFP4 uses two distinct scaling factors, which is its most critical feature. To 
     *   A **Block** is a small, fixed-size chunk of a tensor. In NVFP4, a block is a group of just 16 contiguous numbers. So, the enormous weight and activation tensors above would be partitioned into thousands or millions of these tiny blocks for quantization.
     
     The two-level scaling works as follows:
-    1.  **Coarse, Per-Tensor Scaling (FP32):** First, a single scaling factor is calculated for the *entire tensor* based on its absolute maximum value (max value(abs(tensor))). This factor performs a rough, global adjustment, bringing all the values in the tensor into a more manageable intermediate range.
-    2.  **Fine-Grained, Per-Block Scaling (FP8):** After the first scaling is applied, the tensor is divided into thousands of small 16-element blocks. For *each* of these blocks, a second, more precise scaling factor is calculated. This local factor makes a fine-tuned adjustment, perfectly mapping the 16 values to the extremely limited range of FP4. The FP4 format used here (E2M1) can only represent the values ±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, and ±6.
+    1.  **Coarse, Per-Tensor Scaling (FP32):** First, a single scaling factor is calculated for the *entire tensor* based on its absolute maximum value (max value(abs(tensor))). This factor, stored in high-precision **FP32**, performs a rough, global adjustment, bringing all the values in the tensor into a more manageable intermediate range without the scale factor itself becoming a source of error. Using a high-precision format FP32 is crucial because an imprecise scale factor would inaccurately shrink every value in the tensor, adding error on top of the final quantization step.
+    2.  **Fine-Grained, Per-Block Scaling (FP8):** After the first scaling is applied, the tensor is divided into thousands of small 16-element blocks. For *each* of these blocks, a second, more precise scaling factor is calculated. This local factor, stored in **FP8**, makes a fine-tuned adjustment, perfectly mapping the 16 values to the extremely limited range of FP4. Using FP8 for the block-level scale provides enough precision for local adjustments while remaining efficient for the hardware to process. The FP4 format used here (E2M1) can only represent the values ±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, and ±6.
     
     This dual approach is powerful because it allows for highly localized adaptation. A large outlier in one part of the tensor will only affect the scaling of its tiny 16-element block, leaving the quantization of all other blocks completely unaffected. This preserves significantly more information compared to a single scaling factor.
 *   **Reduced Block Size for Better Dynamic Range:** NVFP4 uses a smaller micro-block size of 16 elements. This is crucial for **capturing the local dynamic range**. In simpler terms, if a block of numbers contains one large outlier, only the other 15 numbers in that small block are affected during scaling. In a larger block (e.g., 32 elements), that same outlier would force a less precise scaling for all 31 other numbers, potentially causing more information loss. The smaller block size isolates the impact of outliers.
@@ -53,12 +55,12 @@ Achieving training outcomes comparable to FP8 requires a specific set of techniq
 
 ### 1. Mixed-Precision Strategy
 
-Quantizing the entire model to FP4 can lead to divergence. A mixed-precision approach is crucial for stability.
+Quantizing the entire model to FP4 can lead to divergence (model stops learning). A mixed-precision approach is crucial for stability.
 
 **Implementation:**
 *   Use NVFP4 for the majority of GEMM operations within the linear (fully-connected) layers.
-*   Maintain a small percentage of numerically sensitive layers (approx. 15%, primarily the final layers of the network) in a higher precision format like BF16 or FP8.
-*   Keep embeddings, normalization layers, attention mechanisms, and optimizer states in higher precision (BF16 or FP32).
+*   Maintain a small percentage of numerically sensitive linear layers (approx. 15%) in a higher precision format like BF16. The paper found that the **final layers** of the network are the most sensitive, as they require a greater dynamic range and more precision than FP4 can provide. Keeping the first and last few blocks of the model in a higher format is often sufficient to ensure stable training.
+*   Keep other critical components in their original precision (BF16 or FP32) to ensure numerical stability. This includes embeddings, the output projection head, normalization layers, non-linearities, and most parts of the attention mechanism (softmax, etc.). Only the large GEMM operations in the transformer blocks are targeted for FP4 quantization.
 
 ### 2. Outlier Management with Random Hadamard Transforms (RHT)
 
