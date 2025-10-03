@@ -116,13 +116,34 @@ Quantizing the entire model to FP4 can lead to divergence (model stops learning)
   
   **Practical Takeaway:** The paper applies this principle using larger 16x16 blocks. Use 16x16 2D block scaling for weight tensors to ensure consistency. For activations and gradients, standard 1D scaling is sufficient, as training is less sensitive to inconsistencies in those tensors.
   
+  > **Why are weights more sensitive than activations?**
+  > The core difference is their role and lifespan during training:
+  > *   **Weights are the model's "long-term memory."** They are persistent parameters that are learned and updated over the entire training process. An inconsistency in a weight's value has a lasting, cascading impact because it's used in every single forward and backward pass, corrupting the learning signal over time.
+  > *   **Activations are "fleeting thoughts."** They are transient values, calculated in a forward pass, used once in the corresponding backward pass, and then discarded. An inconsistency here has a much more localized and temporary effect.
+  > Therefore, the extra effort of 2D scaling is a crucial investment for the persistent weight tensors but offers diminishing returns for the transient activation tensors.
+  
   ### 4. Stochastic Rounding for Unbiased Gradients
   
   When quantizing, many values will fall between the few representable points of FP4. Standard rounding (e.g., always rounding to the nearest value) can introduce a systematic bias. If slightly more numbers round down than up, for instance, there's a consistent downward drift in the values, which can harm learning.
-
-## Empirical Validation: 12B Model on 10T Tokens
-
-This methodology was validated by training a 12-billion parameter hybrid Mamba-Transformer model on 10 trillion tokens.
+  
+  **The Problem: Systematic Bias in Standard Rounding**
+  
+  Imagine your only representable FP4 values are `0` and `1`. Now, consider a block of four high-precision gradient values: `[0.6, 0.7, 0.8, 0.9]`.
+  *   **Standard Rounding:** Using the "round-to-nearest" rule, all four of these values are rounded up to `1`. The new block is `[1, 1, 1, 1]`.
+  *   **The Bias:** The average of the original numbers was `0.75`. The average of the rounded numbers is `1.0`. The rounding has systematically pushed the average value up, introducing an upward bias into the gradient signal. Over thousands of training steps, this small, consistent error can accumulate and lead the model astray.
+  
+  **The Solution: Unbiased Stochastic Rounding**
+  
+  Stochastic rounding is a probabilistic method that eliminates this bias on average.
+  *   **How it works:** Instead of rounding deterministically, it rounds up or down with a probability proportional to the number's distance from the two nearest representable values.
+  *   **In Action:** For the value `0.7`, it has a 70% chance of being rounded up to `1` and a 30% chance of being rounded down to `0`.
+  *   **The Result:** Over a large number of values, this method is statistically unbiased. The *expected* value of rounding `0.7` is `(0.7 * 1) + (0.3 * 0) = 0.7`, which is exactly the original number. It introduces a bit of randomness (noise) to each individual operation, but it ensures that the overall gradient signal remains true over time.
+  
+  **Practical Takeaway:** The paper found it was essential to apply **stochastic rounding** when quantizing gradient tensors. However, for weights and activations in the forward pass, standard **round-to-nearest-even** is better, as the noise from stochastic rounding can be harmful there.
+  
+  ## Empirical Validation: 12B Model on 10T Tokens
+  
+  The paper validates this four-part methodology by pretraining a 12-billion-parameter model on an unprecedented 10 trillion tokens.
 
 **Results:**
 *   **Training Loss:** The validation loss for the NVFP4-trained model closely matched the FP8 baseline throughout the 10T token run.
@@ -142,4 +163,4 @@ NVFP4, when combined with the specified training methodology, enables stable and
 
 ---
 
-***Source:*** *This guide is a summary of the technical report "[Pretraining Large Language Models with NVFP4](https://placeholder_to_paper.com)". For complete details, please refer to the original publication.*
+***Source:*** *This guide is a summary of the technical report "[Pretraining Large Language Models with NVFP4](https://arxiv.org/pdf/2509.25149v1)". For complete details, please refer to the original publication.*
